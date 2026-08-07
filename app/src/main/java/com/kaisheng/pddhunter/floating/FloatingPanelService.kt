@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.*
 import android.os.Build
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.*
 import android.widget.*
