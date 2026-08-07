@@ -46,8 +46,10 @@ android {
 }
 
 dependencies {
-    // Xposed Framework API - 由 workflow 构建时生成 stub jar
-    compileOnly(files("libs/xposed-api-82.jar"))
+    // Xposed Framework API (compileOnly, 不在APK中打包)
+    // 使用 Maven Central 仓库，由 Xposed 框架提供
+    compileOnly("de.robv.android.xposed:api:82")
+    compileOnly("de.robv.android.xposed:api:82:sources")
 
     // AndroidX
     implementation("androidx.core:core-ktx:1.13.1")
