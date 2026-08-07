@@ -1,0 +1,71 @@
+name: Build PDD Coupon Hunter APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /opt/android-sdk
+      ANDROID_SDK_ROOT: /opt/android-sdk
+      GRADLE_VERSION: 8.9
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Android SDK
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends wget unzip > /dev/null
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: 安装 Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -O /tmp/gradle.zip
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> $GITHUB_PATH
+
+      - name: 准备签名密钥
+        run: |
+          mkdir -p keystore
+          keytool -genkeypair -v \
+            -keystore keystore/release.jks \
+            -alias pddhunter \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass pddhunter2026 -keypass pddhunter2026 \
+            -dname "CN=PddHunter, OU=Kaisheng, O=Kaisheng, L=Shantou, ST=Guangdong, C=CN"
+
+      - name: 下载 Xposed API 库
+        run: |
+          mkdir -p app/libs
+          # 下载 Xposed API 82
+          wget -q -O app/libs/xposed-api-82.jar https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar || true
+          # 如果下载失败，使用 compileOnly 方式
+          echo "xposed handled via compileOnly"
+
+      - name: 编译 APK
+        run: |
+          export GRADLE_OPTS="-Dorg.gradle.daemon=false"
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tail -50
+
+      - name: 上传 APK 安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdd-coupon-hunter-apk
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: 上传 debug APK
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdd-coupon-hunter-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
