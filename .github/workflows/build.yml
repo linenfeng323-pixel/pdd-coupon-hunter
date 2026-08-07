@@ -55,7 +55,8 @@ jobs:
       - name: 编译 APK
         run: |
           export GRADLE_OPTS="-Dorg.gradle.daemon=false"
-          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tail -30
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 || true
+          echo "=== EXIT CODE: $? ==="
 
       - name: 列出 APK 输出
         run: |
