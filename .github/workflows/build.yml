@@ -28,11 +28,19 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1
 
-      - name: 安装 Gradle
+      - name: 安装 Gradle 和 JDK
         run: |
           wget -q https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -O /tmp/gradle.zip
           sudo unzip -q /tmp/gradle.zip -d /opt
           echo "/opt/gradle-${GRADLE_VERSION}/bin" >> $GITHUB_PATH
+
+      - name: 编译 Xposed 存根库
+        run: |
+          mkdir -p app/libs
+          javac -d /tmp/xposed-stub-out xposed-stub/de/robv/android/xposed/XposedStub.java
+          cd /tmp/xposed-stub-out
+          jar cf "$GITHUB_WORKSPACE/app/libs/xposed-api-82.jar" .
+          ls -la "$GITHUB_WORKSPACE/app/libs/"
 
       - name: 准备签名密钥
         run: |
@@ -47,7 +55,11 @@ jobs:
       - name: 编译 APK
         run: |
           export GRADLE_OPTS="-Dorg.gradle.daemon=false"
-          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tail -80
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tail -30
+
+      - name: 列出 APK 输出
+        run: |
+          find app/build/outputs -name "*.apk" -type f 2>/dev/null || echo "No APK found"
 
       - name: 上传 APK 安装包
         if: success()
