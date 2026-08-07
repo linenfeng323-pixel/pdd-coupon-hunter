@@ -1,12 +1,12 @@
 package com.kaisheng.pddhunter.config
 
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.*
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import com.kaisheng.pddhunter.R
 import com.kaisheng.pddhunter.floating.FloatingPanelService
@@ -14,8 +14,11 @@ import com.kaisheng.pddhunter.floating.FloatingPanelService
 /**
  * 主界面 — 配置 + 统计
  * 只依赖 StatsStore，完全不引用 Xposed hook 类，杜绝闪退
+ *
+ * 注意：继承原生 android.app.Activity 而非 AppCompatActivity，
+ * 因为主题用的是原生 Material 主题，AppCompat 会因主题不匹配而崩溃。
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
     private lateinit var todayClaimed: TextView
     private lateinit var statusText: TextView
     private lateinit var autoHuntSwitch: SwitchCompat
