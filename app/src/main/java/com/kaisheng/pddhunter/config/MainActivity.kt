@@ -10,8 +10,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import com.kaisheng.pddhunter.R
 import com.kaisheng.pddhunter.floating.FloatingPanelService
-import com.kaisheng.pddhunter.hooks.SilentCouponHunter
 
+/**
+ * 主界面 — 配置 + 统计
+ * 只依赖 StatsStore，完全不引用 Xposed hook 类，杜绝闪退
+ */
 class MainActivity : AppCompatActivity() {
     private lateinit var todayClaimed: TextView
     private lateinit var statusText: TextView
@@ -33,11 +36,10 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main_simple)
-        ConfigManager.init(this)
+        StatsStore.init(this)
         bindViews()
         setupListeners()
         refreshStats()
-        SilentCouponHunter.onStatsChanged = { runOnUiThread { refreshStats() } }
     }
 
     override fun onResume() { super.onResume(); handler.post(refreshRunnable); refreshStats() }
@@ -58,9 +60,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
-        autoHuntSwitch.isChecked = SilentCouponHunter.isActive
+        autoHuntSwitch.isChecked = StatsStore.isActive
         autoHuntSwitch.setOnCheckedChangeListener { _, isChecked ->
-            SilentCouponHunter.isActive = isChecked; refreshStats()
+            StatsStore.isActive = isChecked; refreshStats()
         }
         floatingSwitch.isChecked = ConfigManager.floatingEnabled
         floatingSwitch.setOnCheckedChangeListener { _, isChecked ->
@@ -68,22 +70,22 @@ class MainActivity : AppCompatActivity() {
             if (isChecked) { if (checkOverlayPermission()) startFloating(); else requestOverlayPermission() }
             else { stopService(Intent(this, FloatingPanelService::class.java)) }
         }
-        onlyBigSwitch.isChecked = SilentCouponHunter.onlyBig
-        onlyBigSwitch.setOnCheckedChangeListener { _, isChecked -> SilentCouponHunter.onlyBig = isChecked }
-        intervalSeekBar.progress = (SilentCouponHunter.huntInterval / 10).coerceIn(1, 30) - 1
-        intervalValue.text = "${SilentCouponHunter.huntInterval}秒"
+        onlyBigSwitch.isChecked = ConfigManager.onlyBigCoupon
+        onlyBigSwitch.setOnCheckedChangeListener { _, isChecked -> ConfigManager.onlyBigCoupon = isChecked }
+        intervalSeekBar.progress = (StatsStore.huntInterval / 10).coerceIn(1, 30) - 1
+        intervalValue.text = "${StatsStore.huntInterval}秒"
         intervalSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) {
-                SilentCouponHunter.huntInterval = (p + 1) * 10; intervalValue.text = "${SilentCouponHunter.huntInterval}秒"
+                StatsStore.huntInterval = (p + 1) * 10; intervalValue.text = "${StatsStore.huntInterval}秒"
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
-        minAmountSeekBar.progress = (SilentCouponHunter.minAmount * 2).toInt().coerceIn(0, 100)
-        minAmountValue.text = "${String.format("%.1f", SilentCouponHunter.minAmount)}元"
+        minAmountSeekBar.progress = (ConfigManager.minCouponAmount * 2).toInt().coerceIn(0, 100)
+        minAmountValue.text = "${String.format("%.1f", ConfigManager.minCouponAmount)}元"
         minAmountSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) {
-                SilentCouponHunter.minAmount = p / 2.0; minAmountValue.text = "${String.format("%.1f", p / 2.0)}元"
+                ConfigManager.minCouponAmount = p / 2.0; minAmountValue.text = "${String.format("%.1f", p / 2.0)}元"
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -94,9 +96,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStats() {
-        todayClaimed.text = "${SilentCouponHunter.totalClaimed}"
-        statusText.text = if (SilentCouponHunter.isActive) "🟢 运行中 (${SilentCouponHunter.huntInterval}s轮询)" else "🔴 已暂停"
-        val history = SilentCouponHunter.claimHistory.takeLast(20)
+        todayClaimed.text = "${StatsStore.totalClaimed}"
+        statusText.text = if (StatsStore.isActive) "🟢 运行中 (${StatsStore.huntInterval}s轮询)" else "🔴 已暂停"
+        val history = StatsStore.history.takeLast(20)
         historyList.text = if (history.isEmpty()) "暂无领取记录\n\n模块注入后，打开拼多多即可自动后台静默领取" else history.joinToString("\n")
     }
 
