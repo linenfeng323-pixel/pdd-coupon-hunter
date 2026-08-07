@@ -145,7 +145,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshStats() {
         todayClaimed.text = "${SilentCouponHunter.totalClaimed}"
-        totalClaimed.text = "${SilentCouponHunter.totalClaimed}"
+        totalClaimedText.text = "${SilentCouponHunter.totalClaimed}"
 
         statusText.text = if (SilentCouponHunter.isActive)
             "🟢 运行中 (${SilentCouponHunter.huntInterval}s轮询)"
