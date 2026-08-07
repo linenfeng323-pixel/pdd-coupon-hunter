@@ -1,6 +1,7 @@
 package com.kaisheng.pddhunter.hooks
 
 import android.util.Log
+import com.kaisheng.pddhunter.config.StatsStore
 import de.robv.android.xposed.*
 import de.robv.android.xposed.XC_LoadPackage.LoadPackageParam
 import de.robv.android.xposed.callbacks.XC_LoadPackage
@@ -79,6 +80,12 @@ class SilentCouponHunter : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (lpparam.packageName != PDD) return
         pddClassLoader = lpparam.classLoader
+
+        // 初始化统计存储（用宿主进程上下文），UI层通过 StatsStore 读取
+        try {
+            val ctx = android.app.ActivityThread.currentApplication()
+            if (ctx != null) com.kaisheng.pddhunter.config.StatsStore.init(ctx)
+        } catch (_: Throwable) {}
 
         Log.i(TAG, "╔══════════════════════════════════════╗")
         Log.i(TAG, "║ 拼多多静默券猎人 v3 已注入           ║")
@@ -258,6 +265,7 @@ class SilentCouponHunter : IXposedHookLoadPackage {
                                 val msg = "[动态] ${cls.simpleName}.${method.name}"
                                 Log.i(TAG, "✅ $msg")
                                 totalClaimed++; claimHistory.add(msg)
+                                try { StatsStore.incrementClaimed(); StatsStore.addHistory(msg) } catch (_: Throwable) {}
                                 onCouponClaimed?.invoke("动态发现", 0.0, true, "动态")
                                 onStatsChanged?.invoke()
                             }
@@ -368,6 +376,11 @@ class SilentCouponHunter : IXposedHookLoadPackage {
                                     Log.i(TAG, "⚡ 自动领券: ${cls.simpleName}.${method.name} [$title] ¥$amount")
                                     totalClaimed++; lastClaimTime = System.currentTimeMillis()
                                     claimHistory.add("[$title] ¥$amount ($source)")
+                                    try {
+                                        StatsStore.incrementClaimed()
+                                        StatsStore.addHistory("[$title] ¥$amount ($source)")
+                                        StatsStore.huntInterval = huntInterval
+                                    } catch (_: Throwable) {}
                                     onCouponClaimed?.invoke(title, amount, true, source)
                                     onStatsChanged?.invoke()
                                     return@execute
