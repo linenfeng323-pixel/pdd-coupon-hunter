@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">拼多多券猎人</string>
+    <string name="xposed_module_desc">纯静默后台领券 - Hook内部API直接领取，不占屏幕，不影响前台操作</string>
+</resources>
