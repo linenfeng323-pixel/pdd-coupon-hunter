@@ -2,7 +2,7 @@ package com.kaisheng.pddhunter.hooks
 
 import android.util.Log
 import de.robv.android.xposed.*
-import de.robv.android.xposed.XC_LoadPackage
+import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Modifier
 import java.util.*
 import java.util.concurrent.Executors
