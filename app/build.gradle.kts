@@ -43,15 +43,11 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-    buildFeatures {
-        viewBinding = false
-    }
 }
 
 dependencies {
-    // Xposed Framework API (compileOnly, 不在APK中打包)
-    compileOnly("de.robv.android.xposed:api:82")
-    compileOnly("de.robv.android.xposed:api:82:sources")
+    // Xposed Framework API - 由 workflow 构建时生成 stub jar
+    compileOnly(files("libs/xposed-api-82.jar"))
 
     // AndroidX
     implementation("androidx.core:core-ktx:1.13.1")
