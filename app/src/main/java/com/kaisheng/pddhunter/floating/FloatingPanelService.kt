@@ -14,7 +14,7 @@ import androidx.core.app.NotificationCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.kaisheng.pddhunter.R
-import com.kaisheng.pddhunter.hooks.SilentCouponHunter
+import com.kaisheng.pddhunter.config.StatsStore
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -54,6 +54,7 @@ class FloatingPanelService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        com.kaisheng.pddhunter.config.StatsStore.init(this)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
         Log.i(TAG, "悬浮面板服务创建")
@@ -140,10 +141,10 @@ class FloatingPanelService : Service() {
 
         // 暂停/恢复按钮
         panelView?.findViewById<View>(R.id.toggleBtn)?.setOnClickListener {
-            SilentCouponHunter.isActive = !SilentCouponHunter.isActive
+            StatsStore.isActive = !StatsStore.isActive
             refreshDisplay()
             Toast.makeText(this,
-                if (SilentCouponHunter.isActive) "✅ 自动搞卷已恢复" else "⏸ 自动搞卷已暂停",
+                if (StatsStore.isActive) "✅ 自动搞卷已恢复" else "⏸ 自动搞卷已暂停",
                 Toast.LENGTH_SHORT).show()
         }
     }
@@ -182,17 +183,18 @@ class FloatingPanelService : Service() {
     fun refreshDisplay() {
         if (!isExpanded) return
         try {
+            val stats = com.kaisheng.pddhunter.config.StatsStore
             // 统计
             panelView?.findViewById<TextView>(R.id.todayCount)?.text =
-                "${SilentCouponHunter.totalClaimed}"
+                "${stats.totalClaimed}"
             panelView?.findViewById<TextView>(R.id.totalCount)?.text =
-                "${SilentCouponHunter.totalClaimed}"
+                "${stats.totalClaimed}"
 
             // 状态
             val statusView = panelView?.findViewById<TextView>(R.id.statusText)
             val toggleBtn = panelView?.findViewById<TextView>(R.id.toggleBtn)
-            if (SilentCouponHunter.isActive) {
-                statusView?.text = "🟢 运行中 (${SilentCouponHunter.huntInterval}s轮询)"
+            if (stats.isActive) {
+                statusView?.text = "🟢 运行中 (${stats.huntInterval}s轮询)"
                 statusView?.setTextColor(Color.parseColor("#4CAF50"))
                 toggleBtn?.text = "⏸ 暂停"
                 toggleBtn?.setBackgroundColor(Color.parseColor("#FF5722"))
@@ -205,7 +207,7 @@ class FloatingPanelService : Service() {
 
             // 最近领取记录
             val listView = panelView?.findViewById<RecyclerView>(R.id.historyList)
-            val history = SilentCouponHunter.claimHistory.takeLast(50).toList().reversed()
+            val history = stats.history.takeLast(50).reversed()
             listView?.layoutManager = LinearLayoutManager(this)
             listView?.adapter = HistoryAdapter(history)
         } catch (_: Throwable) {}
@@ -230,7 +232,7 @@ class FloatingPanelService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("拼多多券猎人")
-            .setContentText("已自动领 ${SilentCouponHunter.totalClaimed} 张券")
+            .setContentText("已自动领 ${StatsStore.totalClaimed} 张券")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pi)
             .setOngoing(true)
