@@ -37,6 +37,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main_simple)
         StatsStore.init(this)
+        ConfigManager.init(this)
         bindViews()
         setupListeners()
         refreshStats()
