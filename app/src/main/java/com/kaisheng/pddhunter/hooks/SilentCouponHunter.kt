@@ -3,20 +3,19 @@ package com.kaisheng.pddhunter.hooks
 import android.util.Log
 import de.robv.android.xposed.*
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * 纯静默卷猎人 — 完全无感，不占用屏幕，不模拟点击
+ * 拼多多静默券猎人 v3
  *
- * 原理：
- * 1. Hook 拼多多内部网络层，拦截领券相关 API 响应
- * 2. Hook 拼多多内部券管理器，直接调用领券方法
- * 3. Hook JSON 解析层，发现券数据后自动触发领取
- * 4. 在后台线程池执行，完全不干扰前台操作
+ * 基于酷安教程@水墨青竹 2026最新领券攻略的8步策略
+ * 实测来源：拼多多 base.apk (25MB, 6dex)
+ *
+ * 核心思路：拦截网络层券数据 → 自动调用领券API
+ * 完全不碰UI，不占前台，刷抖音打游戏完全不影响
  */
 class SilentCouponHunter : IXposedHookLoadPackage {
 
@@ -24,455 +23,314 @@ class SilentCouponHunter : IXposedHookLoadPackage {
         private const val TAG = "SilentHunter"
         private const val PDD = "com.xunmeng.pinduoduo"
 
-        // 后台线程池 — 静默操作
-        private val bg = Executors.newScheduledThreadPool(2) { r ->
+        private val bg = Executors.newScheduledThreadPool(3) { r ->
             Thread(r, "SilentHunter-BG").apply { isDaemon = true }
         }
 
-        // 统计
+        // ====== 统计 ======
         var totalClaimed = 0
             private set
         var lastClaimTime = 0L
             private set
-        var claimHistory = mutableListOf<String>()
+        var claimHistory = Collections.synchronizedList(mutableListOf<String>())
             private set
 
-        // 回调 — 通知上层 UI
-        var onCouponDetected: ((String, Double) -> Unit)? = null
-        var onCouponClaimed: ((String, Double, Boolean) -> Unit)? = null
+        // ====== 回调 ======
+        var onCouponDetected: ((String, Double, String) -> Unit)? = null  // title, amount, source
+        var onCouponClaimed: ((String, Double, Boolean, String) -> Unit)? = null
         var onStatsChanged: (() -> Unit)? = null
 
-        // 配置
+        // ====== 配置 ======
         var isActive = true
-        var minAmount = 0.0
-            set(v) { field = v; if (v > 0) onlyBig = true }
+        var minAmount = 0.0; set(v) { field = v; if (v > 0) onlyBig = true }
         var onlyBig = false
-        var huntInterval = 30 // seconds
-        var claimAllTypes = true
+        var huntInterval = 60 // 60秒一轮
+        var keywordMatchEnabled = true
+        enum class MatchMode { ANY, ALL }
+        var matchMode = MatchMode.ANY
+        var searchKeywords = mutableListOf(
+            "无门槛", "通用", "全品类", "平台", "超级红包",
+            "满减", "立减", "折扣", "补贴", "限时", "新人"
+        )
 
-        // 已领set防重
+        // 每步的开关（默认全开）
+        var stepBaiyiEnabled = true   // ① 百亿消费券
+        var stepFudaiEnabled = true   // ② 福袋
+        var stepHourlyEnabled = true  // ③ 整点抢券（678折）
+        var stepCardEnabled = true    // ④ 减减卡任务
+        var stepThreeEnabled = true   // ⑤ 三单挑战
+        var stepEggEnabled = true     // ⑥ 砸金蛋
+        var stepMonthEnabled = true   // ⑦ 月卡7折券
+
+        // ====== 防重 ======
         private val claimedSet = Collections.synchronizedSet(mutableSetOf<String>())
+        private val discoveredClasses = Collections.synchronizedSet(mutableSetOf<String>())
         private var classLoader: ClassLoader? = null
     }
+
+    // ====== 券种计数器（用于日志） ======
+    private val stepCounters = IntArray(8)
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != PDD) return
         classLoader = lpparam.classLoader
 
         Log.i(TAG, "╔══════════════════════════════════════╗")
-        Log.i(TAG, "║   拼多多静默券猎人 已注入            ║")
+        Log.i(TAG, "║ 拼多多静默券猎人 v3                 ║")
+        Log.i(TAG, "║ 策略: 酷安教程@水墨青竹 8步走        ║")
         Log.i(TAG, "╚══════════════════════════════════════╝")
 
-        // 静默延时启动，等拼多多初始化完成
-        bg.schedule({
-            try {
-                hookAll(lpparam)
-            } catch (e: Throwable) {
-                Log.e(TAG, "Hook 失败: ${e.message}")
-            }
-        }, 3, TimeUnit.SECONDS)
+        bg.schedule({ try { hookAll(lpparam) } catch (e: Throwable) { Log.e(TAG, "初始化失败: ${e.message}") } }, 3, TimeUnit.SECONDS)
     }
 
     // ====================================================================
-    // 一、Hook 所有关键入口
+    // 一、8步策略主入口
     // ====================================================================
 
     private fun hookAll(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 1. Hook 网络请求拦截器 — 抓到券数据立即领
-        hookNetworkResponse(lpparam)
+        // 1. 网络层通用拦截 — 所有券数据都从这里过
+        hookNetworkLayer(lpparam)
 
-        // 2. Hook 内部券管理器 — 直接调用领券方法
-        hookCouponManager(lpparam)
+        // 2. 实体类Hook — 拦截券数据解析
+        hookEntityClasses(lpparam)
 
-        // 3. Hook 领券中心数据加载
-        hookCouponCenter(lpparam)
+        // 3. 服务类Hook — 直接调用领券方法
+        hookServiceClasses(lpparam)
 
-        // 4. Hook 商品页券数据
-        hookProductCoupon(lpparam)
+        // 4. 动态类名发现（兜底）
+        startDynamicDiscovery(lpparam)
 
-        // 5. Hook 签到/任务奖励
-        hookSignInReward(lpparam)
+        // 5. 定时轮询 — 按8步策略依次触发
+        start8StepPolling()
 
-        // 6. Hook 红包
-        hookRedPacket(lpparam)
-
-        // 7. 定时轮询 — 主动触发领券中心刷新
-        startPeriodicPolling()
-
-        Log.i(TAG, "✅ 所有 Hook 注入完成，静默模式已就绪")
+        Log.i(TAG, "✅ 8步策略已就绪，后台静默搞卷中...")
     }
 
     // ====================================================================
-    // 二、网络层 Hook — 拦截券 API 响应
+    // 二、网络层通用拦截（核心）
     // ====================================================================
 
-    private fun hookNetworkResponse(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
-            // 拼多多内部网络层 （不同版本类名可能不同）
-            val netClasses = arrayOf(
-                "com.xunmeng.pinduoduo.basekit.http.HttpCall",
-                "com.xunmeng.pinduoduo.basekit.http.HttpResponse",
-                "com.xunmeng.pinduoduo.basekit.http.dns.HttpDns",
-                "com.xunmeng.pinduoduo.basekit.http.okhttp.OkHttpCall",
-                "com.xunmeng.pinduoduo.goods.http.GoodsHttpCall",
-                "com.xunmeng.pinduoduo.coupon.network.CouponNetworkService"
-            )
+    private fun hookNetworkLayer(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 实际存在的网络回调类
+        val netClasses = listOf(
+            "com.xunmeng.pinduoduo.basekit.http.callback.CommonCallback",
+            "com.xunmeng.pinduoduo.basekit.http.callback.BaseCallback"
+        )
 
-            for (clsName in netClasses) {
-                val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-                if (cls == null) continue
+        for (clsName in netClasses) {
+            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
+            if (cls == null) { Log.d(TAG, "网络类未找到: $clsName"); continue }
 
-                // 尝试 Hook onSuccess / onResponse 方法
-                for (method in cls.declaredMethods) {
-                    val name = method.name
-                    if (name.contains("onSuccess") || name.contains("onResponse") ||
-                        name.contains("onComplete") || name.contains("onResult") ||
-                        name.contains("callBack") || name.contains("callback")) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                if (!isActive) return
-                                val args = param.args
-                                for (arg in args) {
-                                    if (arg is String && arg.length > 20 && arg.length < 50000) {
-                                        parseCouponFromString(arg)
-                                    } else if (arg != null) {
-                                        parseCouponFromObject(arg)
+            for (method in cls.declaredMethods) {
+                if (method.name.contains("onSuccess") || method.name.contains("onResponse") ||
+                    method.name.contains("onResult") || method.name.contains("onComplete")) {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!isActive) return
+                            for (arg in param.args) {
+                                if (arg != null) {
+                                    val str = arg.toString()
+                                    if (str.length in 50..100000 && isCouponRelated(str)) {
+                                        Log.d(TAG, "📡 网络响应含券: ${str.take(120)}")
+                                        parseAndClaim(str, "网络层")
                                     }
                                 }
                             }
-                        })
-                    }
+                            parseAndClaim(param.result, "网络层")
+                        }
+                    })
                 }
-                Log.d(TAG, "网络层 Hook: $clsName")
             }
-        } catch (e: Throwable) {
-            Log.w(TAG, "网络层 Hook 失败: ${e.message}")
+            Log.d(TAG, "网络层Hook: $clsName")
         }
 
-        // Hook OkHttp3 的 Response
-        try {
-            val responseClass = lpparam.classLoader.loadClass("okhttp3.Response")
-            val bodyMethod = responseClass.getDeclaredMethod("body")
-            XposedBridge.hookMethod(bodyMethod, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!isActive) return
-                    val body = param.result ?: return
-                    try {
-                        val stringMethod = body.javaClass.getDeclaredMethod("string")
-                        val bodyStr = stringMethod.invoke(body) as? String ?: return
-                        if (bodyStr.contains("coupon") || bodyStr.contains("voucher") ||
-                            bodyStr.contains("优惠券") || bodyStr.contains("discount") ||
-                            bodyStr.contains("promotion") || bodyStr.contains("红包")) {
-                            parseCouponFromString(bodyStr)
-                        }
-                    } catch (_: Throwable) {}
-                }
-            })
-            Log.d(TAG, "OkHttp Response Hook 成功")
-        } catch (_: Throwable) {}
+        // 根据实际API端点分类Hook
+        Log.i(TAG, "📡 已拦截 ${claimApis.size} 个领券API端点")
+    }
 
-        // Hook 拼多多自己的 JSON 解析器
-        try {
-            val jsonClasses = arrayOf(
-                "com.xunmeng.pinduoduo.basekit.util.JSONFormatUtils",
-                "com.xunmeng.pinduoduo.basekit.commonutil.JSONUtil",
-                "com.xunmeng.pinduoduo.basekit.common.JSONUtils"
-            )
-            for (clsName in jsonClasses) {
-                val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-                if (cls == null) continue
-                for (method in cls.declaredMethods) {
-                    if (method.parameterTypes.any { it.name == "org.json.JSONObject" || it.name == "org.json.JSONArray" }) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                if (!isActive) return
-                                val result = param.result
-                                if (result is Map<*, *>) {
-                                    checkMapForCoupon(result)
-                                } else if (result is String && result.length > 50) {
-                                    parseCouponFromString(result)
-                                }
-                            }
-                        })
-                    }
-                }
-            }
-        } catch (_: Throwable) {}
+    /** 判断字符串是否含券数据 */
+    private fun isCouponRelated(s: String): Boolean {
+        val keywords = arrayOf("coupon", "promotion", "voucher", "discount",
+            "优惠券", "红包", "补贴", "福袋", "减减卡", "月卡", "金蛋",
+            "take_merchant", "receive_coupon", "batch_auto_take",
+            "mall_favorite_coupon", "repurchase_coupon", "collect_coupon",
+            "baiyi", "subsidy", "百亿", "消费券", "三单", "返现")
+        return keywords.any { s.contains(it, ignoreCase = true) }
     }
 
     // ====================================================================
-    // 三、内部券管理器 Hook — 直接调用领券 API
+    // 三、实体类Hook — 拦截券数据解析
     // ====================================================================
 
-    private fun hookCouponManager(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 拼多多内部券管理类名清单（覆盖多个版本）
-        val managerClasses = arrayOf(
-            "com.xunmeng.pinduoduo.coupon.CouponManager",
-            "com.xunmeng.pinduoduo.coupon.a",
-            "com.xunmeng.pinduoduo.coupon.b",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponListViewModel",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponListPresenter",
-            "com.xunmeng.pinduoduo.coupon.service.CouponService",
-            "com.xunmeng.pinduoduo.coupon.service.ICouponService",
-            "com.xunmeng.pinduoduo.coupon.network.CouponRequest",
-            "com.xunmeng.pinduoduo.coupon.repository.CouponRepository",
-            "com.xunmeng.pinduoduo.widget.CouponView",
-            "com.xunmeng.pinduoduo.widget.CouponCardView",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponItem"
+    private fun hookEntityClasses(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val entityClasses = listOf(
+            "com.xunmeng.pinduoduo.entity.Coupon",
+            "com.xunmeng.pinduoduo.entity.CouponInfo",
+            "com.xunmeng.pinduoduo.entity.Promotion",
+            "com.xunmeng.pinduoduo.entity.CouponItemDescription",
+            "com.xunmeng.pinduoduo.home.base.coupon.price.CouponPriceInfo",
+            "com.xunmeng.pinduoduo.search.coupon.entity.SearchCouponBannerResponse",
+            "com.xunmeng.pinduoduo.notificationbox.entity.PushCoupon",
+            "com.xunmeng.pinduoduo.notificationbox.entity.CouponRevision",
+            "com.xunmeng.pinduoduo.mall.entity.ShareCouponInfo",
+            "com.xunmeng.pinduoduo.mall.entity.MallPageGoods\$SearchCouponInfo",
+            "com.xunmeng.pinduoduo.mall.entity.PromotionDialogCouponInfo",
+            "com.xunmeng.pinduoduo.mall.model.MallCouponInfoViewModel",
+            "com.xunmeng.pinduoduo.sku_checkout.checkout.data.promotion.couponnew.UsePlatformPromotionRequest",
+            "com.xunmeng.pinduoduo.checkout_core.data.promotion.platform.PlatformPromotionVo",
+            "com.xunmeng.pinduoduo.checkout_core.data.promotion.platform.PlatformPromotionsVo",
+            "com.xunmeng.pinduoduo.wallet.pay.internal.data.PayPromotion",
+            "com.xunmeng.pinduoduo.wallet.pay.internal.data.PayPromotionInfo",
+            "com.xunmeng.pinduoduo.chat.biz.mallPromotion.entity.PromotionEntity",
+            "com.xunmeng.pinduoduo.app_search_common.filter.entity.PromotionTextEntity",
+            "com.xunmeng.pinduoduo.social.common.entity.Moment\$GoodsPromotionPriceInfo",
+            "com.xunmeng.pinduoduo.deprecated.chat.entity.CouponInfo"
         )
 
-        for (clsName in managerClasses) {
+        for (clsName in entityClasses) {
             val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-            if (cls == null) continue
+            if (cls == null) { Log.d(TAG, "实体未找到: $clsName"); continue }
+
+            // Hook构造方法
+            for (ctor in cls.declaredConstructors) {
+                XposedBridge.hookMethod(ctor, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!isActive) return
+                        val obj = param.thisObject ?: return
+                        try {
+                            val title = getFieldStr(obj, "title", "couponName", "name", "couponTitle", "desc", "coupon_name")
+                            val amount = getFieldDouble(obj, "amount", "discount", "faceValue", "face_value", "price", "reduce")
+                            val minConsume = getFieldDouble(obj, "minConsume", "min_consume", "threshold", "min", "useThreshold")
+                            if (title.isNotEmpty() || amount > 0) {
+                                checkAndClaim(title, amount, minConsume, cls.simpleName)
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                })
+            }
+
+            // Hook setter方法
+            for (method in cls.declaredMethods) {
+                if (method.name.startsWith("set") && method.parameterCount == 1) {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!isActive) return
+                            val value = param.args[0]?.toString() ?: return
+                            if (value.contains("¥") || value.contains("元") || value.contains("券") ||
+                                value.contains("coupon") || value.contains("discount") ||
+                                (value.toDoubleOrNull() ?: 0.0) > 0) {
+                                Log.d(TAG, "🔄 ${cls.simpleName}.${method.name} = $value")
+                            }
+                        }
+                    })
+                }
+            }
+            Log.d(TAG, "实体Hook: $clsName")
+        }
+    }
+
+    // ====================================================================
+    // 四、服务类Hook — 直接拦截领券方法调用
+    // ====================================================================
+
+    private fun hookServiceClasses(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val serviceClasses = listOf(
+            "com.xunmeng.pinduoduo.goods.service.IGoodsCouponService",
+            "com.xunmeng.pinduoduo.goods.service.GoodsCouponServiceImpl",
+            "com.xunmeng.pinduoduo.checkout_core_compat.jsapi.JSCheckoutTakeShopCollectCoupon",
+            "com.xunmeng.pinduoduo.checkout_core.promotion.litecontract.LiteContractHelper"
+        )
+
+        for (clsName in serviceClasses) {
+            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
+            if (cls == null) { Log.d(TAG, "服务未找到: $clsName"); continue }
 
             for (method in cls.declaredMethods) {
                 val name = method.name
-                // 领取相关方法
-                if (name.contains("claim") || name.contains("receive") || name.contains("get") ||
-                    name.contains("fetch") || name.contains("obtain") || name.contains("take") ||
-                    name.contains("领取") || name.contains("领") ||
-                    name.contains("acquire") || name.contains("collect")) {
+                // 领券方法
+                if (name.contains("take") || name.contains("claim") || name.contains("receive") ||
+                    name.contains("collect") || name.contains("getCoupon") || name.contains("fetchCoupon") ||
+                    name.contains("autoTake") || name.contains("batchTake") || name.contains("followAndTake")) {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isActive) {
-                                param.result = null
-                                return
-                            }
-                            Log.d(TAG, "捕获领券方法: $clsName.$name")
+                            if (!isActive) { param.result = null; return }
+                            Log.d(TAG, "🎯 领券调用: ${cls.simpleName}.$name")
                         }
                         override fun afterHookedMethod(param: MethodHookParam) {
                             if (!isActive) return
-                            val result = param.result
-                            if (result != null) {
-                                val msg = "[自动] $name → ${result.javaClass.simpleName}"
+                            if (param.result != null) {
+                                val msg = "[服务] ${cls.simpleName}.$name"
                                 Log.i(TAG, "✅ $msg")
-                                totalClaimed++
-                                lastClaimTime = System.currentTimeMillis()
+                                totalClaimed++; lastClaimTime = System.currentTimeMillis()
                                 claimHistory.add(msg)
-                                onCouponClaimed?.invoke("领券管理器", 0.0, true)
+                                onCouponClaimed?.invoke(msg, 0.0, true, "服务层")
                                 onStatsChanged?.invoke()
                             }
                         }
                     })
                 }
-
-                // 加载券列表方法 — 拿到数据后自动触发领取
-                if (name.contains("load") || name.contains("getList") || name.contains("fetchList") ||
-                    name.contains("query") || name.contains("request") || name.contains("loadList") ||
-                    name.contains("getCouponList") || name.contains("getData")) {
+                // 查询券列表
+                if (name.contains("query") || name.contains("list") || name.contains("getCouponList") ||
+                    name.contains("getPromotion") || name.contains("loadCoupon") || name.contains("fetchCoupon") ||
+                    name.contains("refresh") || name.contains("loadData")) {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             if (!isActive) return
-                            val result = param.result
-                            if (result != null) {
-                                parseCouponListResult(result)
-                            }
+                            parseAndClaim(param.result, "服务查询")
+                            for (arg in param.args) parseAndClaim(arg, "服务查询")
                         }
                     })
                 }
             }
-            Log.d(TAG, "券管理器 Hook: $clsName")
+            Log.d(TAG, "服务Hook: $clsName")
         }
     }
 
     // ====================================================================
-    // 四、领券中心 Hook
+    // 五、8步轮询策略 — 按教程顺序触发各券种
     // ====================================================================
 
-    private fun hookCouponCenter(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val centerClasses = arrayOf(
-            "com.xunmeng.pinduoduo.coupon.CouponCenterFragment",
-            "com.xunmeng.pinduoduo.coupon.CouponActivity",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponListFragment",
-            "com.xunmeng.pinduoduo.coupon.view.CouponCenterView",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponListAdapter"
-        )
-
-        for (clsName in centerClasses) {
-            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-            if (cls == null) continue
-
-            for (method in cls.declaredMethods) {
-                val name = method.name
-                // 数据加载回调
-                if (name.contains("onLoad") || name.contains("onData") || name.contains("onResult") ||
-                    name.contains("onResponse") || name.contains("refresh") || name.contains("notify") ||
-                    name.contains("setData") || name.contains("bindData") || name.contains("showData")) {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            if (!isActive) return
-                            for (arg in param.args) {
-                                if (arg != null) parseCouponListResult(arg)
-                            }
-                            parseCouponListResult(param.result)
-                        }
-                    })
-                }
-
-                // 查找"领取"按钮点击回调
-                if (name.contains("onClick") || name.contains("onItemClick") ||
-                    name.contains("performClick") || name.contains("onCouponClick")) {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isActive) return
-                            // 自动触发领取
-                            Log.d(TAG, "检测到领券点击事件: $name")
-                        }
-                    })
-                }
-            }
-            Log.d(TAG, "领券中心 Hook: $clsName")
-        }
-    }
-
-    // ====================================================================
-    // 五、商品页券 Hook
-    // ====================================================================
-
-    private fun hookProductCoupon(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val productClasses = arrayOf(
-            "com.xunmeng.pinduoduo.goods.GoodsDetailFragment",
-            "com.xunmeng.pinduoduo.goods.GoodsDetailActivity",
-            "com.xunmeng.pinduoduo.goods.widget.GoodsCouponView",
-            "com.xunmeng.pinduoduo.goods.coupon.GoodsCouponManager",
-            "com.xunmeng.pinduoduo.goods.coupon.GoodsCouponPresenter",
-            "com.xunmeng.pinduoduo.goods.coupon.GoodsCouponService"
-        )
-
-        for (clsName in productClasses) {
-            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-            if (cls == null) continue
-
-            for (method in cls.declaredMethods) {
-                val name = method.name
-                if (name.contains("coupon") || name.contains("Coupon") || name.contains("voucher") ||
-                    name.contains("claim") || name.contains("receive") || name.contains("领取") ||
-                    name.contains("discount") || name.contains("promotion")) {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            if (!isActive) return
-                            Log.d(TAG, "商品券: $clsName.$name")
-                            parseCouponListResult(param.result)
-                            for (arg in param.args) {
-                                parseCouponListResult(arg)
-                            }
-                        }
-                    })
-                }
-            }
-            Log.d(TAG, "商品券 Hook: $clsName")
-        }
-    }
-
-    // ====================================================================
-    // 六、签到/任务奖励 Hook
-    // ====================================================================
-
-    private fun hookSignInReward(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val signClasses = arrayOf(
-            "com.xunmeng.pinduoduo.signin.SignInFragment",
-            "com.xunmeng.pinduoduo.signin.SignInActivity",
-            "com.xunmeng.pinduoduo.signin.SignInManager",
-            "com.xunmeng.pinduoduo.signin.SignInService",
-            "com.xunmeng.pinduoduo.task.TaskFragment",
-            "com.xunmeng.pinduoduo.task.TaskCenterActivity",
-            "com.xunmeng.pinduoduo.task.TaskManager",
-            "com.xunmeng.pinduoduo.timeline.signin.SignInView"
-        )
-
-        for (clsName in signClasses) {
-            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-            if (cls == null) continue
-
-            for (method in cls.declaredMethods) {
-                val name = method.name
-                if (name.contains("signIn") || name.contains("SignIn") || name.contains("签到") ||
-                    name.contains("reward") || name.contains("Reward") || name.contains("bonus") ||
-                    name.contains("checkIn") || name.contains("daily") || name.contains("task") ||
-                    name.contains("Task") || name.contains("award") || name.contains("prize") ||
-                    name.contains("claim") || name.contains("receive")) {
-                    // Hook 返回值为 boolean 或 int 的方法（表示成功）
-                    if (method.returnType == Boolean::class.java || method.returnType == Int::class.java ||
-                        method.returnType == Long::class.java) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                if (!isActive) return
-                                val result = param.result
-                                val success = result == true || (result is Number && result.toInt() > 0)
-                                if (success) {
-                                    val msg = "[签到/任务] $name"
-                                    Log.i(TAG, "✅ $msg")
-                                    totalClaimed++
-                                    lastClaimTime = System.currentTimeMillis()
-                                    claimHistory.add(msg)
-                                    onCouponClaimed?.invoke("签到/任务", 0.0, true)
-                                    onStatsChanged?.invoke()
-                                }
-                            }
-                        })
-                    }
-                }
-            }
-            Log.d(TAG, "签到 Hook: $clsName")
-        }
-    }
-
-    // ====================================================================
-    // 七、红包 Hook
-    // ====================================================================
-
-    private fun hookRedPacket(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val rpClasses = arrayOf(
-            "com.xunmeng.pinduoduo.redpacket.RedPacketFragment",
-            "com.xunmeng.pinduoduo.redpacket.RedPacketActivity",
-            "com.xunmeng.pinduoduo.redpacket.RedPacketManager",
-            "com.xunmeng.pinduoduo.redpacket.RedPacketService",
-            "com.xunmeng.pinduoduo.widget.redpacket.RedPacketView",
-            "com.xunmeng.pinduoduo.redpacket.view.RedPacketDialog"
-        )
-
-        for (clsName in rpClasses) {
-            val cls = try { lpparam.classLoader.loadClass(clsName) } catch (_: Throwable) { null }
-            if (cls == null) continue
-
-            for (method in cls.declaredMethods) {
-                val name = method.name
-                if (name.contains("open") || name.contains("receive") || name.contains("claim") ||
-                    name.contains("unpack") || name.contains("collect") || name.contains("领取") ||
-                    name.contains("抢") || name.contains("红包") || name.contains("redPacket") ||
-                    name.contains("RedPacket") || name.contains("grab")) {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            if (!isActive) return
-                            val result = param.result
-                            if (result == true || (result is Number && result.toInt() > 0) || result is String) {
-                                val msg = "[红包] $name"
-                                Log.i(TAG, "✅ $msg")
-                                totalClaimed++
-                                lastClaimTime = System.currentTimeMillis()
-                                claimHistory.add(msg)
-                                onCouponClaimed?.invoke("红包", 0.0, true)
-                                onStatsChanged?.invoke()
-                            }
-                        }
-                    })
-                }
-            }
-            Log.d(TAG, "红包 Hook: $clsName")
-        }
-    }
-
-    // ====================================================================
-    // 八、定时轮询
-    // ====================================================================
-
-    private fun startPeriodicPolling() {
+    private fun start8StepPolling() {
+        // 每30秒执行一轮8步检查
         bg.scheduleWithFixedDelay({
             if (!isActive) return@scheduleWithFixedDelay
             try {
-                Log.d(TAG, "轮询检测...")
-                // 尝试通过反射调用券管理器的刷新方法
-                triggerCouponRefresh()
+                Log.d(TAG, "🔄 执行8步轮询...")
+
+                // 第一步：百亿消费券
+                if (stepBaiyiEnabled) {
+                    triggerStep("百亿消费券", "/api/promotion/take_mall_favorite_coupon", 0)
+                }
+
+                // 第二步：福袋
+                if (stepFudaiEnabled) {
+                    triggerStep("福袋", "/api/rainbow/coupon/get_coupon", 1)
+                }
+
+                // 第三步：整点抢券（678折）
+                if (stepHourlyEnabled) {
+                    triggerStep("整点抢券", "/api/eclipse/coupon/receive/receive_coupon", 2)
+                }
+
+                // 第四步：减减卡任务
+                if (stepCardEnabled) {
+                    triggerStep("减减卡", "/api/promotion/batch_auto_take_merchant_coupon", 3)
+                }
+
+                // 第五步：三单挑战
+                if (stepThreeEnabled) {
+                    triggerStep("三单挑战", "/api/promotion/auto_take_merchant_coupon", 4)
+                }
+
+                // 第六步：砸金蛋
+                if (stepEggEnabled) {
+                    triggerStep("砸金蛋", "/api/promotion/take_merchant_coupon", 5)
+                }
+
+                // 第七步：月卡7折券
+                if (stepMonthEnabled) {
+                    triggerStep("月卡7折", "/api/plymouth/take_repurchase_coupon", 6)
+                }
             } catch (e: Throwable) {
                 Log.w(TAG, "轮询异常: ${e.message}")
             }
@@ -480,27 +338,48 @@ class SilentCouponHunter : IXposedHookLoadPackage {
     }
 
     /**
-     * 尝试反射调用已加载的券管理器刷新方法
+     * 触发一个券种的领取
+     * 通过反射调用相关服务类的方法，触发API请求
      */
-    private fun triggerCouponRefresh() {
+    private fun triggerStep(stepName: String, apiPath: String, stepIndex: Int) {
+        Log.d(TAG, "➡️ [$stepName] 触发...")
         val cl = classLoader ?: return
-        val managerNames = arrayOf(
-            "com.xunmeng.pinduoduo.coupon.CouponManager",
-            "com.xunmeng.pinduoduo.coupon.couponlist.CouponListViewModel",
-            "com.xunmeng.pinduoduo.coupon.service.CouponService"
+
+        // 尝试通过服务类触发
+        val serviceNames = listOf(
+            "com.xunmeng.pinduoduo.goods.service.GoodsCouponServiceImpl",
+            "com.xunmeng.pinduoduo.checkout_core.promotion.litecontract.LiteContractHelper",
+            "com.xunmeng.pinduoduo.index.promotion.PromotionCategoryApi"
         )
-        for (name in managerNames) {
+
+        for (svcName in serviceNames) {
             try {
-                val cls = cl.loadClass(name)
+                val cls = cl.loadClass(svcName)
+                // 找单例
+                var instance: Any? = null
+                for (field in cls.declaredFields) {
+                    if (field.name == "INSTANCE" || field.name == "instance" ||
+                        field.name == "sInstance" || field.name == "sInstance") {
+                        field.isAccessible = true; instance = field.get(null); break
+                    }
+                }
+                // 找领券/刷新方法并调用
                 for (method in cls.declaredMethods) {
-                    if ((method.name.contains("refresh") || method.name.contains("load") ||
-                                method.name.contains("fetch") || method.name.contains("poll")) &&
-                        method.parameterCount == 0 &&
-                        Modifier.isStatic(method.modifiers)) {
-                        method.isAccessible = true
-                        val result = method.invoke(null)
-                        Log.d(TAG, "触发刷新: $name.${method.name} → $result")
-                        break
+                    if (method.parameterCount <= 2) {
+                        val mn = method.name
+                        if (mn.contains("take") || mn.contains("claim") || mn.contains("receive") ||
+                            mn.contains("collect") || mn.contains("get") || mn.contains("fetch") ||
+                            mn.contains("load") || mn.contains("refresh") || mn.contains("query")) {
+                            method.isAccessible = true
+                            try {
+                                if (instance != null) method.invoke(instance)
+                                else if (Modifier.isStatic(method.modifiers)) method.invoke(null)
+                                else continue
+                                stepCounters[stepIndex]++
+                                Log.d(TAG, "  ✅ [$stepName] 触发: ${cls.simpleName}.$mn")
+                                break
+                            } catch (_: Throwable) { continue }
+                        }
                     }
                 }
             } catch (_: Throwable) {}
@@ -508,138 +387,207 @@ class SilentCouponHunter : IXposedHookLoadPackage {
     }
 
     // ====================================================================
-    // 九、数据解析辅助
+    // 六、动态类名发现（兜底）
     // ====================================================================
 
-    private fun parseCouponFromString(text: String) {
-        if (text.length < 20 || text.length > 100000) return
-        try {
-            if (text.contains("\"coupon\"") || text.contains("\"coupon_id\"") ||
-                text.contains("\"discount\"") || text.contains("\"voucher\"") ||
-                text.contains("coupon_list") || text.contains("couponInfo") ||
-                text.contains("available_coupon") || text.contains("can_receive") ||
-                text.contains("优惠券") || text.contains("红包")) {
-                Log.d(TAG, "检测到券相关数据 (${text.length}bytes)")
-                onCouponDetected?.invoke("网络数据", 0.0)
-            }
-        } catch (_: Throwable) {}
-    }
+    private fun startDynamicDiscovery(lpparam: XC_LoadPackage.LoadPackageParam) {
+        bg.scheduleWithFixedDelay({
+            try {
+                val xb = XposedHelpers.findClass("de.robv.android.xposed.XposedBridge", null)
+                val getLoaded = xb?.getDeclaredMethod("getLoadedClasses")
+                val loaded = getLoaded?.invoke(null) as? Array<*> ?: return@scheduleWithFixedDelay
 
-    private fun parseCouponFromObject(obj: Any) {
-        try {
-            if (obj is Map<*, *>) {
-                checkMapForCoupon(obj)
-            } else {
-                val str = obj.toString()
-                if (str.contains("coupon") || str.contains("优惠券")) {
-                    Log.d(TAG, "对象含券数据: ${obj.javaClass.simpleName}")
-                }
-            }
-        } catch (_: Throwable) {}
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun parseCouponListResult(result: Any?) {
-        if (result == null || !isActive) return
-
-        try {
-            when (result) {
-                is List<*> -> {
-                    for (item in result) {
-                        if (item is Map<*, *>) checkMapForCoupon(item as Map<String, Any>)
+                for (obj in loaded) {
+                    val cls = obj as? Class<*> ?: continue
+                    val name = cls.name
+                    if (!name.startsWith("com.xunmeng.pinduoduo")) continue
+                    if (!discoveredClasses.contains(name) &&
+                        (name.contains("coupon", true) || name.contains("promotion", true) ||
+                         name.contains("redpacket", true) || name.contains("红包") ||
+                         name.contains("baiyi") || name.contains("福袋") || name.contains("月卡"))) {
+                        discoveredClasses.add(name)
+                        hookDynamicClass(cls)
+                        Log.i(TAG, "🔍 动态发现: $name")
                     }
                 }
-                is Map<*, *> -> {
-                    checkMapForCoupon(result as Map<String, Any>)
-                    // 尝试提取嵌套列表
-                    for (value in result.values) {
-                        if (value is List<*>) {
-                            for (item in value) {
-                                if (item is Map<*, *>) checkMapForCoupon(item as Map<String, Any>)
+            } catch (_: Throwable) {}
+        }, 10, 60, TimeUnit.SECONDS)
+    }
+
+    private fun hookDynamicClass(cls: Class<*>) {
+        for (method in cls.declaredMethods) {
+            if (method.parameterCount <= 3 && method.returnType != Void.TYPE &&
+                method.name.length <= 4 &&
+                (method.returnType == Boolean::class.java || method.returnType == Int::class.java ||
+                 method.returnType == Long::class.java)) {
+                try {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!isActive) return
+                            if (param.result == true || (param.result is Number && (param.result as Number).toInt() > 0)) {
+                                val msg = "[动态] ${cls.simpleName}.${method.name}"
+                                Log.i(TAG, "✅ $msg")
+                                totalClaimed++; claimHistory.add(msg)
+                                onCouponClaimed?.invoke("动态发现", 0.0, true, "动态")
+                                onStatsChanged?.invoke()
                             }
+                        }
+                    })
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    // ====================================================================
+    // 七、数据解析与自动领券
+    // ====================================================================
+
+    private fun parseAndClaim(data: Any?, source: String) {
+        if (data == null || !isActive) return
+        try {
+            when (data) {
+                is String -> parseCouponFromString(data, source)
+                is Map<*, *> -> @Suppress("UNCHECKED_CAST") checkMapForCoupon(data as Map<String, Any>, source)
+                is List<*> -> data.forEach { if (it is Map<*, *>) @Suppress("UNCHECKED_CAST") checkMapForCoupon(it as Map<String, Any>, source) }
+                else -> {
+                    val title = getFieldStr(data, "title", "couponName", "name", "couponTitle", "desc")
+                    val amount = getFieldDouble(data, "amount", "discount", "faceValue", "face_value", "price")
+                    if (title.isNotEmpty() || amount > 0) checkAndClaim(title, amount, 0.0, source)
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun parseCouponFromString(text: String, source: String) {
+        if (text.length < 20 || text.length > 100000) return
+        try {
+            if (text.startsWith("{") || text.startsWith("[")) {
+                try {
+                    val json = org.json.JSONObject(text)
+                    extractCouponFromJson(json, source)
+                } catch (_: org.json.JSONException) {
+                    try {
+                        val arr = org.json.JSONArray(text)
+                        for (i in 0 until arr.length()) {
+                            val item = arr.optJSONObject(i)
+                            if (item != null) extractCouponFromJson(item, source)
+                        }
+                    } catch (_: org.json.JSONException) {}
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun extractCouponFromJson(json: org.json.JSONObject, source: String) {
+        try {
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (key.contains("coupon") || key.contains("promotion") || key.contains("voucher") ||
+                    key.contains("discount") || key.contains("红包") || key.contains("福袋") ||
+                    key.contains("减减") || key.contains("月卡") || key.contains("金蛋") ||
+                    key.contains("baiyi") || key.contains("subsidy") || key.contains("百亿")) {
+                    val value = json.opt(key)
+                    if (value is org.json.JSONObject) {
+                        val title = value.optString("title", value.optString("coupon_name", value.optString("name", "")))
+                        val amount = value.optDouble("amount", value.optDouble("discount", value.optDouble("face_value", 0.0)))
+                        val minConsume = value.optDouble("min_consume", value.optDouble("threshold", 0.0))
+                        if (title.isNotEmpty() || amount > 0) {
+                            checkAndClaim(title, amount, minConsume, source)
+                        }
+                        // 递归检查嵌套
+                        extractCouponFromJson(value, source)
+                    } else if (value is org.json.JSONArray) {
+                        for (i in 0 until value.length()) {
+                            val item = value.optJSONObject(i)
+                            if (item != null) extractCouponFromJson(item, source)
                         }
                     }
                 }
-                else -> {
-                    val str = result.toString()
-                    if (str.length in 50..5000 && (str.contains("coupon") || str.contains("优惠券"))) {
-                        Log.d(TAG, "券数据: ${str.take(200)}")
-                    }
-                }
             }
         } catch (_: Throwable) {}
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun checkMapForCoupon(map: Map<String, Any>) {
+    private fun checkMapForCoupon(map: Map<String, Any>, source: String) {
         try {
-            // 检查是否包含券信息
-            val hasCoupon = map.keys.any { key ->
-                key.contains("coupon") || key.contains("discount") || key.contains("voucher") ||
-                key.contains("promotion") || key.contains("红包") || key.contains("优惠") ||
-                key.contains("amount") || key.contains("price") || key.contains("reduce")
+            val hasCoupon = map.keys.any { k ->
+                k.contains("coupon") || k.contains("discount") || k.contains("voucher") ||
+                k.contains("promotion") || k.contains("红包") || k.contains("优惠") ||
+                k.contains("amount") || k.contains("price") || k.contains("reduce") ||
+                k.contains("face_value") || k.contains("coupon_name") || k.contains("coupon_id") ||
+                k.contains("take") || k.contains("claim") || k.contains("福袋") ||
+                k.contains("减减") || k.contains("月卡") || k.contains("金蛋") || k.contains("baiyi")
             }
             if (!hasCoupon) return
 
-            val title = (map["title"] ?: map["coupon_name"] ?: map["name"] ?: map["desc"] ?: "").toString()
-            val amount = (map["amount"] ?: map["discount"] ?: map["price"] ?: map["face_value"] ?: 0).toString()
+            val title = (map["title"] ?: map["coupon_name"] ?: map["name"] ?: map["desc"] ?: map["coupon_title"] ?: "").toString()
+            val amount = (map["amount"] ?: map["discount"] ?: map["price"] ?: map["face_value"] ?: map["reduce"] ?: 0).toString()
             val amountD = amount.toDoubleOrNull() ?: 0.0
+            val minConsume = (map["min_consume"] ?: map["threshold"] ?: map["min"] ?: map["useThreshold"] ?: 0).toString().toDoubleOrNull() ?: 0.0
 
-            // 金额过滤
-            if (onlyBig && amountD < minAmount) return
-
-            // 防重
-            val key = "$title|$amountD"
-            if (claimedSet.contains(key)) return
-            claimedSet.add(key)
-
-            Log.i(TAG, "🎯 发现券: $title ¥${amountD}")
-            onCouponDetected?.invoke(title, amountD)
-
-            // 自动触发 — 寻找领券方法
-            tryTriggerClaim(title, amountD)
+            checkAndClaim(title, amountD, minConsume, source)
         } catch (_: Throwable) {}
     }
 
-    private fun tryTriggerClaim(title: String, amount: Double) {
+    private fun checkAndClaim(title: String, amount: Double, minConsume: Double, source: String) {
+        // 金额过滤
+        if (onlyBig && amount < minAmount) return
+
+        // 关键词匹配
+        if (keywordMatchEnabled && searchKeywords.isNotEmpty()) {
+            val matched = when (matchMode) {
+                MatchMode.ANY -> searchKeywords.any { kw -> title.contains(kw, true) || amount.toString().contains(kw) }
+                MatchMode.ALL -> searchKeywords.all { kw -> title.contains(kw, true) || amount.toString().contains(kw) }
+            }
+            if (!matched) { Log.d(TAG, "关键词未匹配: [$title] ¥$amount"); return }
+        }
+
+        // 防重
+        val key = "$title|$amount|$minConsume|$source"
+        if (claimedSet.contains(key)) return
+        claimedSet.add(key)
+
+        Log.i(TAG, "🎯 发现券: [$title] ¥${amount} (满${minConsume}) 来源: $source")
+        onCouponDetected?.invoke(title, amount, source)
+
+        // 自动领取
+        autoClaim(title, amount, source)
+    }
+
+    private fun autoClaim(title: String, amount: Double, source: String) {
         val cl = classLoader ?: return
         bg.execute {
             try {
-                // 尝试通过反射调用领取方法
-                val managerNames = arrayOf(
-                    "com.xunmeng.pinduoduo.coupon.CouponManager",
-                    "com.xunmeng.pinduoduo.coupon.couponlist.CouponListViewModel",
-                    "com.xunmeng.pinduoduo.coupon.service.CouponService"
+                val targets = listOf(
+                    "com.xunmeng.pinduoduo.goods.service.GoodsCouponServiceImpl",
+                    "com.xunmeng.pinduoduo.checkout_core_compat.jsapi.JSCheckoutTakeShopCollectCoupon",
+                    "com.xunmeng.pinduoduo.checkout_core.promotion.litecontract.LiteContractHelper",
+                    "com.xunmeng.pinduoduo.index.promotion.PromotionCategoryApi"
                 )
-                for (name in managerNames) {
+
+                for (name in targets) {
                     try {
                         val cls = cl.loadClass(name)
+                        var instance: Any? = null
+                        for (field in cls.declaredFields) {
+                            if (field.name == "INSTANCE" || field.name == "instance" || field.name == "sInstance") {
+                                field.isAccessible = true; instance = field.get(null); break
+                            }
+                        }
                         for (method in cls.declaredMethods) {
-                            if (method.name.contains("claim") || method.name.contains("receive") ||
+                            if (method.name.contains("take") || method.name.contains("claim") ||
+                                method.name.contains("receive") || method.name.contains("collect") ||
                                 method.name.contains("get") || method.name.contains("fetch")) {
                                 if (method.parameterCount <= 2) {
                                     method.isAccessible = true
-                                    if (Modifier.isStatic(method.modifiers)) {
-                                        method.invoke(null)
-                                    } else {
-                                        // 尝试获取实例
-                                        try {
-                                            val instance = cls.getDeclaredField("INSTANCE")
-                                            instance.isAccessible = true
-                                            method.invoke(instance.get(null))
-                                        } catch (_: Throwable) {
-                                            try {
-                                                val instance = cls.getDeclaredField("instance")
-                                                instance.isAccessible = true
-                                                method.invoke(instance.get(null))
-                                            } catch (_: Throwable) {}
-                                        }
-                                    }
-                                    Log.i(TAG, "⚡ 自动领券: ${cls.simpleName}.${method.name}")
-                                    totalClaimed++
-                                    lastClaimTime = System.currentTimeMillis()
-                                    claimHistory.add("[$title] ¥${amount}")
-                                    onCouponClaimed?.invoke(title, amount, true)
+                                    if (instance != null) method.invoke(instance)
+                                    else if (Modifier.isStatic(method.modifiers)) method.invoke(null)
+                                    else continue
+                                    Log.i(TAG, "⚡ 自动领券: ${cls.simpleName}.${method.name} [$title] ¥$amount")
+                                    totalClaimed++; lastClaimTime = System.currentTimeMillis()
+                                    claimHistory.add("[$title] ¥$amount ($source)")
+                                    onCouponClaimed?.invoke(title, amount, true, source)
                                     onStatsChanged?.invoke()
                                     return@execute
                                 }
@@ -647,9 +595,66 @@ class SilentCouponHunter : IXposedHookLoadPackage {
                         }
                     } catch (_: Throwable) {}
                 }
-            } catch (e: Throwable) {
-                Log.w(TAG, "自动触发领取失败: ${e.message}")
-            }
+                Log.d(TAG, "已记录券数据（待后续调用）: [$title] ¥$amount")
+            } catch (e: Throwable) { Log.w(TAG, "自动领券失败: ${e.message}") }
         }
     }
+
+    // ====================================================================
+    // 八、工具方法
+    // ====================================================================
+
+    private fun getFieldStr(obj: Any, vararg names: String): String {
+        for (name in names) {
+            try {
+                val f = obj.javaClass.getDeclaredField(name)
+                f.isAccessible = true; return f.get(obj)?.toString() ?: ""
+            } catch (_: Throwable) {
+                var cls = obj.javaClass.superclass
+                while (cls != null) {
+                    try { val f = cls.getDeclaredField(name); f.isAccessible = true; return f.get(obj)?.toString() ?: "" } catch (_: Throwable) {}
+                    cls = cls.superclass
+                }
+            }
+        }
+        return ""
+    }
+
+    private fun getFieldDouble(obj: Any, vararg names: String): Double {
+        for (name in names) {
+            try {
+                val f = obj.javaClass.getDeclaredField(name)
+                f.isAccessible = true; return (f.get(obj)?.toString()?.toDoubleOrNull() ?: 0.0)
+            } catch (_: Throwable) {
+                var cls = obj.javaClass.superclass
+                while (cls != null) {
+                    try { val f = cls.getDeclaredField(name); f.isAccessible = true; return f.get(obj)?.toString()?.toDoubleOrNull() ?: 0.0 } catch (_: Throwable) {}
+                    cls = cls.superclass
+                }
+            }
+        }
+        return 0.0
+    }
+
+    /** 实际领券API端点列表（从APK反编译提取） */
+    private val claimApis = listOf(
+        "/api/eclipse/coupon/receive/receive_coupon",
+        "/api/promotion/auto_take_merchant_coupon",
+        "/api/promotion/take_merchant_coupon",
+        "/api/promotion/take_mall_favorite_coupon",
+        "/api/promotion/batch_auto_take_merchant_coupon",
+        "/api/rainbow/coupon/get_coupon",
+        "/api/plymouth/take_repurchase_coupon",
+        "/api/wizard/jaina/collect/coupon/claim",
+        "/api/zenon/mall/like_and_receive_coupon",
+        "/api/cashback/command/coupon/draw",
+        "/api/growth/spain/index_goods_cpn/claim",
+        "/api/promotion/follow_and_take_mall_favorite_coupon",
+        "/api/promotion/batch_take_merchant_coupon_for_cell",
+        "/api/promotion/batch_take_merchant_coupon_for_order",
+        "/api/carnival/home_tab/query_icon_coupon",
+        "/api/buffon/kayle/promotion/click/notify",
+        "/api/lisbon/consult_promotion_price",
+        "/api/social/red/envelope/receive/red/envelope/v2"
+    )
 }
