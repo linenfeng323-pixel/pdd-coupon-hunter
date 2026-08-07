@@ -44,28 +44,89 @@ jobs:
             -storepass pddhunter2026 -keypass pddhunter2026 \
             -dname "CN=PddHunter, OU=Kaisheng, O=Kaisheng, L=Shantou, ST=Guangdong, C=CN"
 
-      - name: 下载 Xposed API 库
+      - name: 创建 Xposed API stub
         run: |
           mkdir -p app/libs
-          # 下载 Xposed API 82
-          wget -q -O app/libs/xposed-api-82.jar https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar || true
-          # 如果下载失败，使用 compileOnly 方式
-          echo "xposed handled via compileOnly"
+          # 生成 Xposed API stub jar
+          cat > /tmp/XposedStub.java << 'JAVAEOF'
+          package de.robv.android.xposed;
+          public interface IXposedHookLoadPackage extends IXposedMod {
+              void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          interface IXposedMod {}
+          class XC_LoadPackage extends XCallback {
+              public static class LoadPackageParam {
+                  public String packageName; public String processName;
+                  public ClassLoader classLoader; public boolean isFirstApplication;
+              }
+          }
+          abstract class XCallback {
+              public int priority = PRIORITY_DEFAULT;
+              public static final int PRIORITY_DEFAULT = 50;
+              public static final int PRIORITY_HIGHEST = 10000;
+              public static final int PRIORITY_LOWEST = -10000;
+              public static class Param { public Object[] args; public Object result; public Throwable throwable; }
+              public static class MethodHookParam extends Param {
+                  public Object thisObject;
+                  public Object getResult() { return result; }
+                  public void setResult(Object r) { this.result = r; }
+              }
+          }
+          class XposedBridge {
+              public static void hookMethod(Object m, XC_MethodHook c) {}
+              public static void log(String t) { System.out.println("Xposed: "+t); }
+          }
+          class XposedHelpers {
+              public static Class<?> findClass(String n, ClassLoader cl) { try { return Class.forName(n,false,cl); } catch(Exception e) { return null; } }
+              public static Object callMethod(Object o, String m, Object... a) { return null; }
+              public static void findAndHookMethod(String c, ClassLoader cl, String m, Object... p) {}
+              public static void findAndHookMethod(Class<?> c, String m, Object... p) {}
+          }
+          class XC_MethodHook extends XCallback {
+              protected void beforeHookedMethod(XC_MethodHook.MethodHookParam p) throws Throwable {}
+              protected void afterHookedMethod(XC_MethodHook.MethodHookParam p) throws Throwable {}
+          }
+          JAVAEOF
+          # 生成 callbacks 包
+          cat > /tmp/XCCallbacks.java << 'JAVAEOF'
+          package de.robv.android.xposed.callbacks;
+          import de.robv.android.xposed.XCallback;
+          public class XC_LoadPackage extends XCallback {
+              public static class LoadPackageParam {
+                  public String packageName; public String processName;
+                  public ClassLoader classLoader; public boolean isFirstApplication;
+              }
+              public XC_LoadPackage() { super(); }
+              public XC_LoadPackage(int priority) { super(priority); }
+          }
+          JAVAEOF
+          # 编译并打包
+          cd /tmp && mkdir -p xposed-out
+          javac -d xposed-out XposedStub.java XCCallbacks.java
+          cd xposed-out && jar cf /tmp/xposed-api-82.jar de/
+          cp /tmp/xposed-api-82.jar "$GITHUB_WORKSPACE/app/libs/"
+          ls -la "$GITHUB_WORKSPACE/app/libs/"
 
       - name: 编译 APK
         run: |
-          export GRADLE_OPTS="-Dorg.gradle.daemon=false"
-          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tail -50
+          echo "=== 开始编译 ==="
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | head -200
+          echo "=== 编译结果 ==="
+          find app/build -name "*.apk" 2>/dev/null
+          ls -la app/build/outputs/apk/release/ 2>/dev/null || echo "无release输出"
+          ls -la app/build/outputs/apk/debug/ 2>/dev/null || echo "无debug输出"
 
-      - name: 上传 APK 安装包
+      - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
           name: pdd-coupon-hunter-apk
           path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
 
-      - name: 上传 debug APK
+      - name: 上传 Debug APK
         if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: pdd-coupon-hunter-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
