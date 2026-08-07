@@ -21,7 +21,7 @@ import com.kaisheng.pddhunter.hooks.SilentCouponHunter
 class MainActivity : AppCompatActivity() {
 
     private lateinit var todayClaimed: TextView
-    private lateinit var totalClaimed: TextView
+    private lateinit var totalClaimedText: TextView
     private lateinit var statusText: TextView
     private lateinit var autoHuntSwitch: SwitchCompat
     private lateinit var floatingSwitch: SwitchCompat
@@ -67,7 +67,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         todayClaimed = findViewById(R.id.todayClaimed)
-        totalClaimed = findViewById(R.id.totalClaimed)
+        totalClaimedText = findViewById(R.id.totalClaimed)
         statusText = findViewById(R.id.statusText)
         autoHuntSwitch = findViewById(R.id.autoHuntSwitch)
         floatingSwitch = findViewById(R.id.floatingSwitch)
