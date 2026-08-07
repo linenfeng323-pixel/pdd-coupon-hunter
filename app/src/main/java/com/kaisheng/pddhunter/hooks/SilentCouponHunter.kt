@@ -83,7 +83,9 @@ class SilentCouponHunter : IXposedHookLoadPackage {
 
         // 初始化统计存储（用宿主进程上下文），UI层通过 StatsStore 读取
         try {
-            val ctx = android.app.ActivityThread.currentApplication()
+            val atClass = java.lang.Class.forName("android.app.ActivityThread")
+            val atMethod = atClass.getMethod("currentApplication")
+            val ctx = atMethod.invoke(null) as? android.content.Context
             if (ctx != null) com.kaisheng.pddhunter.config.StatsStore.init(ctx)
         } catch (_: Throwable) {}
 
