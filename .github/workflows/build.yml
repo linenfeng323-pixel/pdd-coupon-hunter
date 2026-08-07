@@ -37,7 +37,9 @@ jobs:
       - name: 编译 Xposed 存根库
         run: |
           mkdir -p app/libs
-          javac -d /tmp/xposed-stub-out xposed-stub/de/robv/android/xposed/*.java
+          # 编译所有存根
+          find xposed-stub -name "*.java" > /tmp/xposed-sources.txt
+          javac -d /tmp/xposed-stub-out @/tmp/xposed-sources.txt
           cd /tmp/xposed-stub-out
           jar cf "$GITHUB_WORKSPACE/app/libs/xposed-api-82.jar" .
           ls -la "$GITHUB_WORKSPACE/app/libs/"
