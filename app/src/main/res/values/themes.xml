@@ -1,14 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.PddHunter" parent="Theme.MaterialComponents.Light.DayNight.NoActionBar">
+    <style name="Theme.PddHunter" parent="Theme.AppCompat.Light.DayNight.NoActionBar">
         <item name="colorPrimary">@color/primary</item>
         <item name="colorPrimaryDark">@color/primary_dark</item>
         <item name="colorAccent">@color/accent</item>
         <item name="android:statusBarColor">@color/primary_dark</item>
-    </style>
-    <style name="CardStyle" parent="Widget.MaterialComponents.CardView">
-        <item name="cardCornerRadius">12dp</item>
-        <item name="cardElevation">2dp</item>
-        <item name="contentPadding">16dp</item>
     </style>
 </resources>
